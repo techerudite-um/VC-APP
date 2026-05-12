@@ -13,6 +13,10 @@ const {
   deleteConferenceRoom,
   buildJoinToken,
   checkLiveKitHealth,
+  muteParticipantMicrophone,
+  muteParticipantScreenShareTracks,
+  setParticipantScreenShareAllowed,
+  removeRoomParticipant,
   getCachedParticipants,
 } = require('./services/livekitService');
 const { createApiRateLimiter } = require('./middleware/rateLimiter');
@@ -66,10 +70,9 @@ async function handleHealth(req, res, next) {
 async function main() {
   const env = loadEnv();
   await connectDB();
-  console.log("Call")
 
   const roomClient = getRoomServiceClient({
-    host: "https://demo-video-calling-8z1c86xj.livekit.cloud",
+    host: env.LIVEKIT_HTTP_URL,
     apiKey: env.LIVEKIT_API_KEY,
     apiSecret: env.LIVEKIT_API_SECRET,
   });
@@ -81,8 +84,7 @@ async function main() {
   app.use(compression());
   app.use(
     cors({
-      origin: env.CLIENT_URL,
-      credentials: false,
+      origin: "*"
     })
   );
   app.use(express.json());
@@ -100,6 +102,13 @@ async function main() {
       createRoom: (roomId) => createConferenceRoom(roomClient, roomId),
       getCachedParticipants: (roomId) => getCachedParticipants(roomId),
       deleteRoom: (roomId) => deleteConferenceRoom(roomClient, roomId),
+      muteParticipant: (roomId, identity, muted) =>
+        muteParticipantMicrophone(roomClient, roomId, identity, muted),
+      muteScreenShareTrack: (roomId, identity, muted) =>
+        muteParticipantScreenShareTracks(roomClient, roomId, identity, muted),
+      setScreenShare: (roomId, identity, allowed) =>
+        setParticipantScreenShareAllowed(roomClient, roomId, identity, allowed),
+      removeParticipant: (roomId, identity) => removeRoomParticipant(roomClient, roomId, identity),
     })
   );
 

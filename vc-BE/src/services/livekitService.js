@@ -1,4 +1,5 @@
 const NodeCache = require('node-cache');
+const { TrackSource } = require('@livekit/protocol');
 const { RoomServiceClient, AccessToken, TwirpError } = require('livekit-server-sdk');
 
 const participantsCache = new NodeCache({ stdTTL: 2 });
@@ -34,6 +35,15 @@ function isLikelyConnectivityError(err) {
  */
 function mapLiveKitError(err) {
   if (err instanceof TwirpError) {
+    if (err.status === 401 || err.status === 403) {
+      const e = /** @type {Error & { statusCode?: number }} */ (
+        new Error(
+          'LiveKit API rejected the credentials. Use LIVEKIT_API_KEY and LIVEKIT_API_SECRET from the same LiveKit project as LIVEKIT_WS_URL (and ensure LIVEKIT_HTTP_URL / LIVEKIT_URL matches that project).'
+        )
+      );
+      e.statusCode = 502;
+      return e;
+    }
     if (err.status === 404 || err.code === 'not_found') {
       const e = /** @type {Error & { statusCode?: number }} */ (new Error('Room not found'));
       e.statusCode = 404;
@@ -114,6 +124,107 @@ function listRoomParticipants(client, roomId) {
 }
 
 /**
+ * @param {string} roomId
+ */
+function invalidateParticipantsCache(roomId) {
+  participantsCache.del(`participants_${roomId}`);
+}
+
+/**
+ * @param {import('@livekit/protocol').ParticipantPermission | undefined} permission
+ */
+function isScreenShareAllowedByPermission(permission) {
+  const sources = permission?.canPublishSources;
+  if (!sources || sources.length === 0) {
+    return true;
+  }
+  return sources.includes(TrackSource.SCREEN_SHARE) || sources.includes(TrackSource.SCREEN_SHARE_AUDIO);
+}
+
+/**
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} identity
+ * @param {boolean} muted
+ */
+async function muteParticipantMicrophone(client, roomId, identity, muted) {
+  const info = await withLiveKitHandling(() => client.getParticipant(roomId, identity));
+  const mic = info.tracks?.find((t) => t.source === TrackSource.MICROPHONE);
+  if (!mic?.sid) {
+    const e = new Error('Participant has no microphone track');
+    e.statusCode = 404;
+    throw e;
+  }
+  await withLiveKitHandling(() => client.mutePublishedTrack(roomId, identity, mic.sid, muted));
+  invalidateParticipantsCache(roomId);
+}
+
+/**
+ * Server-side mute/unmute for screen share (and screen share audio) tracks.
+ * Uses RoomServiceClient.mutePublishedTrack — same pattern as microphone moderation.
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} identity
+ * @param {boolean} muted
+ */
+async function muteParticipantScreenShareTracks(client, roomId, identity, muted) {
+  const info = await withLiveKitHandling(() => client.getParticipant(roomId, identity));
+  const screenTracks = (info.tracks ?? []).filter(
+    (t) => t.source === TrackSource.SCREEN_SHARE || t.source === TrackSource.SCREEN_SHARE_AUDIO
+  );
+  const withSid = screenTracks.filter((t) => Boolean(t.sid));
+  if (withSid.length === 0) {
+    const e = new Error('Participant has no screen share track');
+    e.statusCode = 404;
+    throw e;
+  }
+  for (const t of withSid) {
+    await withLiveKitHandling(() => client.mutePublishedTrack(roomId, identity, t.sid, muted));
+  }
+  invalidateParticipantsCache(roomId);
+}
+
+/**
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} identity
+ * @param {boolean} allowed
+ */
+async function setParticipantScreenShareAllowed(client, roomId, identity, allowed) {
+  const sources = allowed
+    ? [
+        TrackSource.CAMERA,
+        TrackSource.MICROPHONE,
+        TrackSource.SCREEN_SHARE,
+        TrackSource.SCREEN_SHARE_AUDIO,
+      ]
+    : [TrackSource.CAMERA, TrackSource.MICROPHONE];
+  await withLiveKitHandling(() =>
+    client.updateParticipant(roomId, identity, {
+      permission: {
+        canSubscribe: true,
+        canPublish: true,
+        canPublishData: true,
+        canPublishSources: sources,
+        hidden: false,
+        recorder: false,
+      },
+    })
+  );
+  invalidateParticipantsCache(roomId);
+}
+
+/**
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} identity
+ */
+async function removeRoomParticipant(client, roomId, identity) {
+  await withLiveKitHandling(() => client.removeParticipant(roomId, identity));
+  invalidateParticipantsCache(roomId);
+}
+
+/**
  * Deletes a room by name.
  * @param {RoomServiceClient} client
  * @param {string} roomId
@@ -145,11 +256,23 @@ async function getCachedParticipants(roomId) {
 
   const mapped = {
     count: participants.length,
-    participants: participants.map((p) => ({
-      identity: p.identity,
-      joinedAt: new Date(Number(p.joinedAt) * 1000).toISOString(),
-      isPublishing: p.tracks && p.tracks.length > 0,
-    })),
+    participants: participants.map((p) => {
+      const mic = p.tracks?.find((t) => t.source === TrackSource.MICROPHONE);
+      const screenTracks = (p.tracks ?? []).filter(
+        (t) => t.source === TrackSource.SCREEN_SHARE || t.source === TrackSource.SCREEN_SHARE_AUDIO
+      );
+      const hasActiveScreenShare = screenTracks.some((t) => t.sid && !t.muted);
+      const joinedSec = p.joinedAt != null ? Number(p.joinedAt) : 0;
+      return {
+        identity: p.identity,
+        joinedAt: new Date(joinedSec * 1000).toISOString(),
+        isPublishing: Boolean(p.tracks && p.tracks.length > 0),
+        microphoneTrackSid: mic?.sid ?? null,
+        isMicrophoneMuted: Boolean(mic?.muted),
+        screenShareAllowed: isScreenShareAllowedByPermission(p.permission),
+        hasActiveScreenShare,
+      };
+    }),
   };
 
   participantsCache.set(cacheKey, mapped);
@@ -170,7 +293,6 @@ async function checkLiveKitHealth() {
     return livekitHealthCache.status;
   }
   try {
-    console.log(roomServiceClient)
     await roomServiceClient.listRooms();
     livekitHealthCache = { status: 'connected', checkedAt: now };
   } catch (err) {
@@ -194,19 +316,27 @@ async function checkLiveKitHealth() {
  */
 async function buildJoinToken(params) {
   const { apiKey, apiSecret, roomId, isAdmin, participantName } = params;
-  console.log(params)
   const identity = isAdmin ? 'admin' : participantName;
   const ttlSeconds = 2 * 60 * 60;
   const token = new AccessToken(apiKey, apiSecret, {
     identity,
     ttl: ttlSeconds,
   });
-  /** @type {Record<string, unknown>} */
+  const screenSources = [
+    TrackSource.CAMERA,
+    TrackSource.MICROPHONE,
+    TrackSource.SCREEN_SHARE,
+    TrackSource.SCREEN_SHARE_AUDIO,
+  ];
+  const guestSources = [TrackSource.CAMERA, TrackSource.MICROPHONE];
+  /** @type {import('livekit-server-sdk').VideoGrant} */
   const grant = {
     roomJoin: true,
     room: roomId,
-    canPublish: true,
     canSubscribe: true,
+    canPublishData: true,
+    canPublish: true,
+    canPublishSources: isAdmin ? screenSources : guestSources,
   };
   if (isAdmin) {
     grant.roomAdmin = true;
@@ -224,4 +354,9 @@ module.exports = {
   buildJoinToken,
   getCachedParticipants,
   checkLiveKitHealth,
+  muteParticipantMicrophone,
+  muteParticipantScreenShareTracks,
+  setParticipantScreenShareAllowed,
+  removeRoomParticipant,
+  invalidateParticipantsCache,
 };

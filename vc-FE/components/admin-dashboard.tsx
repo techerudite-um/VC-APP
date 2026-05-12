@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/auth-context";
-import { createRoom, getParticipants, getToken } from "@/lib/api";
+import { createRoom, getParticipants, getToken, moderateParticipantMute, moderateParticipantScreenShare, moderateParticipantScreenShareMute, removeParticipantFromRoom } from "@/lib/api";
 import {
   Copy,
   Check,
@@ -12,6 +12,13 @@ import {
   Users,
   LogOut,
   Clock,
+  Mic,
+  MicOff,
+  Monitor,
+  MonitorOff,
+  UserMinus,
+  Loader2,
+  ScreenShareOff,
 } from "lucide-react";
 import { BrandIcon } from "./brand-icon";
 
@@ -24,9 +31,19 @@ export function AdminDashboard() {
   const [createError, setCreateError] = useState("");
   const [startMeetingError, setStartMeetingError] = useState("");
   const [participants, setParticipants] = useState<
-    { identity: string; joinedAt: string; isPublishing: boolean }[]
+    {
+      identity: string;
+      joinedAt: string;
+      isPublishing: boolean;
+      microphoneTrackSid: string | null;
+      isMicrophoneMuted: boolean;
+      screenShareAllowed: boolean;
+      hasActiveScreenShare: boolean;
+    }[]
   >([]);
   const [participantCount, setParticipantCount] = useState(0);
+  const [moderationBusy, setModerationBusy] = useState<string | null>(null);
+  const [moderationError, setModerationError] = useState("");
 
   useEffect(() => {
     if (!isAdmin) {
@@ -105,6 +122,22 @@ export function AdminDashboard() {
   const handleLogout = () => {
     logout();
     navigate("/admin/login");
+  };
+
+  const isHostIdentity = (identity: string) => identity === "admin";
+
+  const runModeration = async (key: string, fn: () => Promise<void>) => {
+    if (!roomId) return;
+    setModerationError("");
+    setModerationBusy(key);
+    try {
+      await fn();
+      await pollParticipants(roomId);
+    } catch (e) {
+      setModerationError(e instanceof Error ? e.message : "Action failed");
+    } finally {
+      setModerationBusy(null);
+    }
   };
 
   const formatJoinedAt = (iso: string) =>
@@ -225,6 +258,21 @@ export function AdminDashboard() {
             <Users className="w-5 h-5" />
             Connected Participants
           </h2>
+          <p className="text-xs text-muted-foreground mb-4">
+            Controls map to LiveKit Room Service: <span className="font-medium">Remove</span> uses{" "}
+            <span className="font-mono">removeParticipant</span>; <span className="font-medium">Mute</span> uses{" "}
+            <span className="font-mono">mutePublishedTrack</span> on the microphone;{" "}
+            <span className="font-medium">Stop share</span> uses{" "}
+            <span className="font-mono">mutePublishedTrack</span> on screen share tracks;{" "}
+            <span className="font-medium">Allow / Block share</span> uses{" "}
+            <span className="font-mono">updateParticipant</span> (<span className="font-mono">canPublishSources</span>
+            ). The host (<span className="font-mono">admin</span>) cannot be removed.
+          </p>
+          {moderationError && (
+            <div className="mb-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
+              <p className="text-sm text-destructive-foreground">{moderationError}</p>
+            </div>
+          )}
 
           {participants.length === 0 ? (
             <p className="text-muted-foreground text-center py-8">
@@ -235,26 +283,146 @@ export function AdminDashboard() {
               {participants.map((participant) => (
                 <div
                   key={participant.identity}
-                  className="flex items-center justify-between p-4 bg-secondary rounded-lg"
+                  className="flex flex-col gap-3 p-4 bg-secondary rounded-lg sm:flex-row sm:items-center sm:justify-between"
                 >
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 bg-primary/20 rounded-full flex items-center justify-center">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-10 h-10 bg-primary/20 rounded-full flex items-center justify-center shrink-0">
                       <span className="text-primary font-semibold">
                         {participant.identity.charAt(0).toUpperCase()}
                       </span>
                     </div>
-                    <div className="flex flex-col">
-                      <span className="text-foreground font-medium">
+                    <div className="flex flex-col min-w-0">
+                      <span className="text-foreground font-medium truncate">
                         {participant.identity}
                       </span>
-                      {participant.isPublishing && (
-                        <span className="text-xs text-muted-foreground">Publishing</span>
-                      )}
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                        {participant.isPublishing && <span>Publishing</span>}
+                        {participant.microphoneTrackSid && (
+                          <span>
+                            Mic: {participant.isMicrophoneMuted ? "muted" : "live"}
+                          </span>
+                        )}
+                        <span>
+                          Screen share: {participant.screenShareAllowed ? "allowed" : "blocked"}
+                          {participant.hasActiveScreenShare ? " · live" : ""}
+                        </span>
+                      </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                    <Clock className="w-4 h-4" />
-                    {formatJoinedAt(participant.joinedAt)}
+                  <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                    <div className="flex items-center gap-2 text-muted-foreground text-sm mr-auto sm:mr-0">
+                      <Clock className="w-4 h-4 shrink-0" />
+                      {formatJoinedAt(participant.joinedAt)}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={
+                        !roomId ||
+                        moderationBusy !== null ||
+                        !participant.microphoneTrackSid
+                      }
+                      onClick={() =>
+                        void runModeration(`mute:${participant.identity}`, async () => {
+                          await moderateParticipantMute(
+                            roomId!,
+                            participant.identity,
+                            !participant.isMicrophoneMuted
+                          );
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-border bg-card text-foreground text-xs font-medium hover:bg-accent disabled:opacity-50"
+                      title={
+                        participant.isMicrophoneMuted ? "Unmute microphone" : "Mute microphone"
+                      }
+                    >
+                      {moderationBusy === `mute:${participant.identity}` ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : participant.isMicrophoneMuted ? (
+                        <MicOff className="w-4 h-4" />
+                      ) : (
+                        <Mic className="w-4 h-4" />
+                      )}
+                      {participant.isMicrophoneMuted ? "Unmute" : "Mute"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        !roomId ||
+                        moderationBusy !== null ||
+                        !participant.hasActiveScreenShare
+                      }
+                      onClick={() =>
+                        void runModeration(`ssmute:${participant.identity}`, async () => {
+                          await moderateParticipantScreenShareMute(roomId!, participant.identity, true);
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-border bg-card text-foreground text-xs font-medium hover:bg-accent disabled:opacity-50"
+                      title="Stop current screen share (server mute on screen share tracks)"
+                    >
+                      {moderationBusy === `ssmute:${participant.identity}` ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <ScreenShareOff className="w-4 h-4" />
+                      )}
+                      Stop share
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!roomId || moderationBusy !== null}
+                      onClick={() =>
+                        void runModeration(`ss:${participant.identity}`, async () => {
+                          await moderateParticipantScreenShare(
+                            roomId!,
+                            participant.identity,
+                            !participant.screenShareAllowed
+                          );
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-border bg-card text-foreground text-xs font-medium hover:bg-accent disabled:opacity-50"
+                      title={
+                        participant.screenShareAllowed
+                          ? "Disallow screen sharing"
+                          : "Allow screen sharing"
+                      }
+                    >
+                      {moderationBusy === `ss:${participant.identity}` ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : participant.screenShareAllowed ? (
+                        <Monitor className="w-4 h-4" />
+                      ) : (
+                        <MonitorOff className="w-4 h-4" />
+                      )}
+                      {participant.screenShareAllowed ? "Block share" : "Allow share"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        !roomId ||
+                        moderationBusy !== null ||
+                        isHostIdentity(participant.identity)
+                      }
+                      onClick={() => {
+                        if (
+                          !window.confirm(
+                            `Remove "${participant.identity}" from the meeting? They can rejoin with the link.`
+                          )
+                        ) {
+                          return;
+                        }
+                        void runModeration(`rm:${participant.identity}`, async () => {
+                          await removeParticipantFromRoom(roomId!, participant.identity);
+                        });
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-destructive/50 text-destructive-foreground text-xs font-medium hover:bg-destructive/10 disabled:opacity-50"
+                      title="Remove from meeting"
+                    >
+                      {moderationBusy === `rm:${participant.identity}` ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <UserMinus className="w-4 h-4" />
+                      )}
+                      Remove
+                    </button>
                   </div>
                 </div>
               ))}

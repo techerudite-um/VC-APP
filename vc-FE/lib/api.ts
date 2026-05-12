@@ -71,9 +71,63 @@ export async function createRoom(): Promise<{
 
 export async function getParticipants(roomId: string): Promise<{
   count: number;
-  participants: { identity: string; joinedAt: string; isPublishing: boolean }[];
+  participants: {
+    identity: string;
+    joinedAt: string;
+    isPublishing: boolean;
+    microphoneTrackSid: string | null;
+    isMicrophoneMuted: boolean;
+    screenShareAllowed: boolean;
+    hasActiveScreenShare: boolean;
+  }[];
 }> {
   const { data } = await api.get(`/api/rooms/${encodeURIComponent(roomId)}/participants`);
+  return data;
+}
+
+export async function moderateParticipantMute(
+  roomId: string,
+  identity: string,
+  muted: boolean
+): Promise<{ success: true; muted: boolean }> {
+  const { data } = await api.post(
+    `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/mute`,
+    { muted }
+  );
+  return data;
+}
+
+export async function moderateParticipantScreenShareMute(
+  roomId: string,
+  identity: string,
+  muted: boolean
+): Promise<{ success: true; muted: boolean }> {
+  const { data } = await api.post(
+    `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/screen-share/mute`,
+    { muted }
+  );
+  return data;
+}
+
+export async function moderateParticipantScreenShare(
+  roomId: string,
+  identity: string,
+  allowed: boolean
+): Promise<{ success: true; allowed: boolean }> {
+  const { data } = await api.post(
+    `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/screen-share`,
+    { allowed }
+  );
+  return data;
+}
+
+export async function removeParticipantFromRoom(
+  roomId: string,
+  identity: string
+): Promise<{ success: true }> {
+  const { data } = await api.delete(
+    `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}`
+  );
   return data;
 }
 

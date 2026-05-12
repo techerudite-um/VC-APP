@@ -4,13 +4,19 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   LiveKitRoom,
+  useLocalParticipantPermissions,
   useRoomContext,
   useParticipants,
   useLocalParticipant,
 } from "@livekit/components-react";
+import { supportsScreenSharing } from "@livekit/components-core";
+import { Track } from "livekit-client";
 import { LiveMeetVideoConference } from "./livemeet-video-conference";
+import { InRoomModerationPanel } from "./in-room-moderation-panel";
 import { BrandIcon } from "./brand-icon";
+import { useAuth } from "@/contexts/auth-context";
 import { deleteRoom } from "@/lib/api";
+import { isBrowserMediaPermissionDenied } from "@/lib/media-errors";
 import {
   Mic,
   MicOff,
@@ -20,9 +26,24 @@ import {
   PhoneOff,
   Users,
   AlertTriangle,
+  X,
 } from "lucide-react";
 
 const MAX_PARTICIPANTS = 30;
+
+/** Same mapping as LiveKit `ControlBar` for `ParticipantPermission.canPublishSources`. */
+function trackSourceToProtocol(source: Track.Source): number {
+  switch (source) {
+    case Track.Source.Camera:
+      return 1;
+    case Track.Source.Microphone:
+      return 2;
+    case Track.Source.ScreenShare:
+      return 3;
+    default:
+      return 0;
+  }
+}
 
 type VideoRoomLocationState = {
   token: string;
@@ -36,6 +57,7 @@ export function VideoRoom() {
   const location = useLocation();
   const navigate = useNavigate();
   const state = location.state as VideoRoomLocationState | null;
+  const [connectMediaError, setConnectMediaError] = useState("");
 
   useEffect(() => {
     if (!state?.token || !state?.wsUrl) {
@@ -55,8 +77,13 @@ export function VideoRoom() {
       token={state.token}
       serverUrl={state.wsUrl}
       connect={true}
-      audio
-      video
+      onError={(err) => {
+        if (isBrowserMediaPermissionDenied(err)) {
+          setConnectMediaError(
+            "The browser blocked camera or microphone when joining. You can still use the room: allow access from the lock icon in the address bar, or turn the mic/camera on below when you are ready."
+          );
+        }
+      }}
       onDisconnected={() => {
         if (meetingIsAdmin) {
           navigate("/admin/dashboard");
@@ -65,13 +92,27 @@ export function VideoRoom() {
         }
       }}
     >
-      <VideoRoomChrome roomId={roomId} />
+      <VideoRoomChrome
+        roomId={roomId}
+        connectMediaError={connectMediaError}
+        onDismissConnectMediaError={() => setConnectMediaError("")}
+      />
     </LiveKitRoom>
   );
 }
 
-function VideoRoomChrome({ roomId }: { roomId: string }) {
+function VideoRoomChrome({
+  roomId,
+  connectMediaError,
+  onDismissConnectMediaError,
+}: {
+  roomId: string;
+  connectMediaError: string;
+  onDismissConnectMediaError: () => void;
+}) {
   const navigate = useNavigate();
+  const { isAdmin, adminToken } = useAuth();
+  const canUseHostApi = Boolean(isAdmin && adminToken);
   const room = useRoomContext();
   const participants = useParticipants();
   const {
@@ -80,22 +121,61 @@ function VideoRoomChrome({ roomId }: { roomId: string }) {
     isCameraEnabled,
     isScreenShareEnabled,
   } = useLocalParticipant();
+  const localPermissions = useLocalParticipantPermissions();
   const [endMeetingError, setEndMeetingError] = useState("");
+  const [deviceError, setDeviceError] = useState("");
+
+  const canPublishScreenShare =
+    localPermissions &&
+    localPermissions.canPublish &&
+    (localPermissions.canPublishSources.length === 0 ||
+      localPermissions.canPublishSources.includes(trackSourceToProtocol(Track.Source.ScreenShare)));
+  const showScreenShareButton =
+    supportsScreenSharing() && (Boolean(canPublishScreenShare) || isScreenShareEnabled);
 
   const isRoomFull = participants.length >= MAX_PARTICIPANTS;
-  const isAdminStorage =
-    typeof window !== "undefined" && localStorage.getItem("isAdmin") === "true";
 
   const toggleMute = async () => {
-    await localParticipant.setMicrophoneEnabled(!isMicrophoneEnabled);
+    setDeviceError("");
+    try {
+      await localParticipant.setMicrophoneEnabled(!isMicrophoneEnabled);
+    } catch (e) {
+      if (isBrowserMediaPermissionDenied(e)) {
+        setDeviceError(
+          "Microphone access was blocked. Click the lock or site settings icon in the address bar and allow the microphone for this site."
+        );
+      } else {
+        setDeviceError(e instanceof Error ? e.message : "Could not change microphone");
+      }
+    }
   };
 
   const toggleCamera = async () => {
-    await localParticipant.setCameraEnabled(!isCameraEnabled);
+    setDeviceError("");
+    try {
+      await localParticipant.setCameraEnabled(!isCameraEnabled);
+    } catch (e) {
+      if (isBrowserMediaPermissionDenied(e)) {
+        setDeviceError(
+          "Camera access was blocked. Allow the camera in the browser site settings, or keep the camera off."
+        );
+      } else {
+        setDeviceError(e instanceof Error ? e.message : "Could not change camera");
+      }
+    }
   };
 
   const toggleScreenShare = async () => {
-    await localParticipant.setScreenShareEnabled(!isScreenShareEnabled);
+    setDeviceError("");
+    try {
+      await localParticipant.setScreenShareEnabled(!isScreenShareEnabled);
+    } catch (e) {
+      if (isBrowserMediaPermissionDenied(e)) {
+        setDeviceError("Screen sharing was cancelled or blocked by the browser.");
+      } else {
+        setDeviceError(e instanceof Error ? e.message : "Could not change screen share");
+      }
+    }
   };
 
   const handleLeave = () => {
@@ -148,7 +228,7 @@ function VideoRoomChrome({ roomId }: { roomId: string }) {
               </span>
             </div>
 
-            {isAdminStorage && (
+            {canUseHostApi && (
               <button
                 type="button"
                 onClick={() => void handleEndMeetingForAll()}
@@ -162,6 +242,23 @@ function VideoRoomChrome({ roomId }: { roomId: string }) {
         {endMeetingError && (
           <p className="text-sm text-destructive-foreground">{endMeetingError}</p>
         )}
+        {(connectMediaError || deviceError) && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-foreground">
+            <span className="min-w-0 flex-1">{connectMediaError || deviceError}</span>
+            <button
+              type="button"
+              onClick={() => {
+                onDismissConnectMediaError();
+                setDeviceError("");
+              }}
+              className="shrink-0 rounded p-0.5 hover:bg-amber-500/20"
+              aria-label="Dismiss notice"
+            >
+              <X className="size-4" />
+            </button>
+          </div>
+        )}
+        <InRoomModerationPanel roomId={roomId} />
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-x-clip p-2 sm:p-4">
@@ -206,18 +303,20 @@ function VideoRoomChrome({ roomId }: { roomId: string }) {
             )}
           </button>
 
-          <button
-            type="button"
-            onClick={() => void toggleScreenShare()}
-            className={`p-4 rounded-full transition-colors ${
-              isScreenShareEnabled
-                ? "bg-green-600 text-white hover:bg-green-700"
-                : "bg-secondary text-foreground hover:bg-accent"
-            }`}
-            title={isScreenShareEnabled ? "Stop sharing" : "Share screen"}
-          >
-            <MonitorUp className="w-6 h-6" />
-          </button>
+          {showScreenShareButton && (
+            <button
+              type="button"
+              onClick={() => void toggleScreenShare()}
+              className={`p-4 rounded-full transition-colors ${
+                isScreenShareEnabled
+                  ? "bg-green-600 text-white hover:bg-green-700"
+                  : "bg-secondary text-foreground hover:bg-accent"
+              }`}
+              title={isScreenShareEnabled ? "Stop sharing" : "Share screen"}
+            >
+              <MonitorUp className="w-6 h-6" />
+            </button>
+          )}
 
           <button
             type="button"

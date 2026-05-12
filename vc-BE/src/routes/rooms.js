@@ -93,12 +93,134 @@ async function handleListParticipants(deps, req, res, next) {
       res.status(404).json({ error: 'Room not found' });
       return;
     }
+    // eslint-disable-next-line no-console
+    console.error('[rooms/participants] LiveKit listParticipants failed:', e);
+    const statusCode =
+      e && typeof e === 'object' && 'statusCode' in e && Number.isFinite(Number(e.statusCode))
+        ? Number(e.statusCode)
+        : 503;
+    const message = e instanceof Error ? e.message : 'LiveKit service unavailable';
+    next(new AppError(message, statusCode >= 400 && statusCode < 600 ? statusCode : 503));
+  }
+}
+
+/**
+ * @param {string} identity
+ * @returns {boolean}
+ */
+function isProtectedHostIdentity(identity) {
+  return identity === 'admin';
+}
+
+/**
+ * Microphone track mute — RoomServiceClient.mutePublishedTrack (microphone source).
+ * @param {{ muteParticipant: (roomId: string, identity: string, muted: boolean) => Promise<void> }} deps
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
+async function handleMuteParticipant(deps, req, res, next) {
+  try {
+    const { roomId, identity } = req.params;
+    const id = decodeURIComponent(identity);
+    const muted = Boolean(req.body?.muted);
+    await deps.muteParticipant(roomId, id, muted);
+    res.json({ success: true, muted });
+  } catch (e) {
+    if (e && typeof e === 'object' && 'statusCode' in e && /** @type {{ statusCode: number }} */ (e).statusCode === 404) {
+      res.status(404).json({ error: e instanceof Error ? e.message : 'Not found' });
+      return;
+    }
+    if (isLiveKitRoomNotFound(e)) {
+      res.status(404).json({ error: 'Room not found' });
+      return;
+    }
     next(new AppError('LiveKit service unavailable', 503));
   }
 }
 
 /**
- * Deletes a room by id (admin only).
+ * Screen share track mute via RoomServiceClient.mutePublishedTrack.
+ * @param {{ muteScreenShareTrack: (roomId: string, identity: string, muted: boolean) => Promise<void> }} deps
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
+async function handleMuteParticipantScreenShare(deps, req, res, next) {
+  try {
+    const { roomId, identity } = req.params;
+    const id = decodeURIComponent(identity);
+    const muted = Boolean(req.body?.muted);
+    await deps.muteScreenShareTrack(roomId, id, muted);
+    res.json({ success: true, muted });
+  } catch (e) {
+    if (e && typeof e === 'object' && 'statusCode' in e && /** @type {{ statusCode: number }} */ (e).statusCode === 404) {
+      res.status(404).json({ error: e instanceof Error ? e.message : 'Not found' });
+      return;
+    }
+    if (isLiveKitRoomNotFound(e)) {
+      res.status(404).json({ error: 'Room not found' });
+      return;
+    }
+    next(new AppError('LiveKit service unavailable', 503));
+  }
+}
+
+/**
+ * Participant publish permission for screen share (RoomServiceClient.updateParticipant).
+ * @param {{ setScreenShare: (roomId: string, identity: string, allowed: boolean) => Promise<void> }} deps
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
+async function handleScreenSharePermission(deps, req, res, next) {
+  try {
+    const { roomId, identity } = req.params;
+    const id = decodeURIComponent(identity);
+    const allowed = Boolean(req.body?.allowed);
+    await deps.setScreenShare(roomId, id, allowed);
+    res.json({ success: true, allowed });
+  } catch (e) {
+    if (isLiveKitRoomNotFound(e)) {
+      res.status(404).json({ error: 'Room not found' });
+      return;
+    }
+    next(new AppError('LiveKit service unavailable', 503));
+  }
+}
+
+/**
+ * Kick participant — RoomServiceClient.removeParticipant.
+ * @param {{ removeParticipant: (roomId: string, identity: string) => Promise<void> }} deps
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
+async function handleRemoveParticipant(deps, req, res, next) {
+  try {
+    const { roomId, identity } = req.params;
+    const id = decodeURIComponent(identity);
+    if (isProtectedHostIdentity(id)) {
+      next(new AppError('Cannot remove the host/admin connection', 400));
+      return;
+    }
+    await deps.removeParticipant(roomId, id);
+    res.json({ success: true });
+  } catch (e) {
+    if (isLiveKitRoomNotFound(e)) {
+      res.status(404).json({ error: 'Room not found' });
+      return;
+    }
+    next(new AppError('LiveKit service unavailable', 503));
+  }
+}
+
+/**
+ * Deletes a room by id (admin only). Uses LiveKit `deleteRoom`.
  * @param {{ deleteRoom: (id: string) => Promise<void> }} deps
  * @param {import('express').Request} req
  * @param {import('express').Response} res
@@ -135,7 +257,7 @@ async function handleDeleteRoom(deps, req, res, next) {
 
 /**
  * Creates the rooms router (create, list participants, delete).
- * @param {{ createRoom: (id: string) => Promise<unknown>; getCachedParticipants: (id: string) => Promise<{ count: number; participants: unknown[] }>; deleteRoom: (id: string) => Promise<void> }} deps
+ * @param {{ createRoom: (id: string) => Promise<unknown>; getCachedParticipants: (id: string) => Promise<{ count: number; participants: unknown[] }>; deleteRoom: (id: string) => Promise<void>; muteParticipant: (roomId: string, identity: string, muted: boolean) => Promise<void>; muteScreenShareTrack: (roomId: string, identity: string, muted: boolean) => Promise<void>; setScreenShare: (roomId: string, identity: string, allowed: boolean) => Promise<void>; removeParticipant: (roomId: string, identity: string) => Promise<void> }} deps
  * @returns {import('express').Router}
  */
 function createRoomsRouter(deps) {
@@ -146,9 +268,38 @@ function createRoomsRouter(deps) {
     verifyAdmin,
     (req, res, next) => handleCreateRoom(deps, req, res, next)
   );
+  router.post(
+    '/:roomId/participants/:identity/mute',
+    verifyAdmin,
+    (req, res, next) => handleMuteParticipant(deps, req, res, next)
+  );
+  router.post(
+    '/:roomId/participants/:identity/screen-share/mute',
+    verifyAdmin,
+    (req, res, next) => handleMuteParticipantScreenShare(deps, req, res, next)
+  );
+  router.post(
+    '/:roomId/participants/:identity/screen-share',
+    verifyAdmin,
+    (req, res, next) => handleScreenSharePermission(deps, req, res, next)
+  );
+  router.delete(
+    '/:roomId/participants/:identity',
+    verifyAdmin,
+    (req, res, next) => handleRemoveParticipant(deps, req, res, next)
+  );
   router.get('/:roomId/participants', verifyAdmin, (req, res, next) => handleListParticipants(deps, req, res, next));
   router.delete('/:roomId', verifyAdmin, (req, res, next) => handleDeleteRoom(deps, req, res, next));
   return router;
 }
 
-module.exports = { createRoomsRouter, handleCreateRoom, handleListParticipants, handleDeleteRoom };
+module.exports = {
+  createRoomsRouter,
+  handleCreateRoom,
+  handleListParticipants,
+  handleDeleteRoom,
+  handleMuteParticipant,
+  handleMuteParticipantScreenShare,
+  handleScreenSharePermission,
+  handleRemoveParticipant,
+};
