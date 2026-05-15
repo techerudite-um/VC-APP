@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useState, type ReactNode } from "react";
+import { readAdminToken } from "@/lib/session";
 
 interface AuthContextType {
   isAdmin: boolean;
@@ -13,11 +14,9 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [adminToken, setAdminToken] = useState<string | null>(() =>
-    typeof window !== "undefined" ? localStorage.getItem("adminToken") : null
-  );
+  const [adminToken, setAdminToken] = useState<string | null>(() => readAdminToken());
   const [isAdmin, setIsAdmin] = useState(
-    () => typeof window !== "undefined" && localStorage.getItem("isAdmin") === "true"
+    () => typeof window !== "undefined" && readAdminToken() !== null && localStorage.getItem("isAdmin") === "true"
   );
   const [isLoading] = useState(false);
 

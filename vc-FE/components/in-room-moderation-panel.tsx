@@ -10,6 +10,7 @@ import {
   moderateParticipantScreenShareMute,
   removeParticipantFromRoom,
 } from "@/lib/api";
+import { isValidRoomId, readAdminToken } from "@/lib/session";
 import { Loader2, Mic, MicOff, Monitor, MonitorOff, ScreenShareOff, UserMinus } from "lucide-react";
 
 type ParticipantRow = {
@@ -23,15 +24,15 @@ type ParticipantRow = {
 };
 
 export function InRoomModerationPanel({ roomId }: { roomId: string }) {
-  const { isAdmin, adminToken } = useAuth();
-  const canModerate = Boolean(isAdmin && adminToken);
+  const { isAdmin } = useAuth();
+  const canModerate = Boolean(isAdmin && readAdminToken() && isValidRoomId(roomId));
 
   const [rows, setRows] = useState<ParticipantRow[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    if (!canModerate || !roomId) return;
+    if (!canModerate) return;
     try {
       const data = await getParticipants(roomId);
       setRows(data.participants);
@@ -69,12 +70,12 @@ export function InRoomModerationPanel({ roomId }: { roomId: string }) {
     <div className="rounded-lg border border-border bg-secondary/50 px-3 py-2.5 sm:px-4">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3 mb-2">
         <p className="text-xs font-medium text-foreground">Host controls (this meeting)</p>
-        <Link
+        {/* <Link
           to="/admin/dashboard"
           className="text-xs text-primary hover:underline shrink-0"
         >
           Open full dashboard
-        </Link>
+        </Link> */}
       </div>
       <p className="text-[11px] text-muted-foreground mb-2">
         Mute, stop screen share, allow/block sharing, or remove participants via the LiveKit server API.

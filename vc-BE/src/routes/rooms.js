@@ -15,7 +15,7 @@ function isLiveKitRoomNotFound(err) {
 }
 
 /**
- * Creates a new conference room and returns join URL metadata.
+ * Creates or returns the permanent admin conference room.
  * @param {{ createRoom: (id: string) => Promise<unknown> }} deps
  * @param {import('express').Request} req
  * @param {import('express').Response} res
@@ -23,6 +23,49 @@ function isLiveKitRoomNotFound(err) {
  * @returns {Promise<void>}
  */
 async function handleCreateRoom(deps, req, res, next) {
+  try {
+    let existingRoom = await Room.findOne({ createdBy: 'admin', permanent: true }).lean();
+
+    if (!existingRoom) {
+      existingRoom = await Room.findOne({ createdBy: 'admin' }).sort({ createdAt: 1 }).lean();
+    }
+
+    if (existingRoom) {
+      const storedRoomId =
+        typeof existingRoom.roomId === 'string' ? existingRoom.roomId.trim() : '';
+      if (!storedRoomId) {
+        await Room.deleteOne({ _id: existingRoom._id });
+      } else {
+        if (existingRoom.permanent !== true) {
+          await Room.updateOne(
+            { _id: existingRoom._id },
+            { $set: { permanent: true, isActive: true } },
+          );
+        }
+        try {
+          await deps.ensureRoomExists(storedRoomId);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[createRoom] could not ensure room exists:',
+            err instanceof Error ? err.message : err
+          );
+        }
+        res.json({
+          roomId: storedRoomId,
+          roomUrl: `${req.app.locals.env.CLIENT_URL}/room/${storedRoomId}`,
+          message: 'Share this link with your team to join the meeting',
+        });
+        return;
+      }
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[rooms/create] MongoDB error while checking permanent room:', e);
+    next(new AppError('Database error', 500));
+    return;
+  }
+
   let roomId;
   try {
     let attempts = 0;
@@ -59,11 +102,16 @@ async function handleCreateRoom(deps, req, res, next) {
   }
 
   try {
-    await Room.create({ roomId });
+    await Room.create({
+      roomId,
+      createdBy: 'admin',
+      isActive: true,
+      permanent: true,
+    });
   } catch (persistErr) {
     // eslint-disable-next-line no-console
     console.warn(
-      '[rooms/create] MongoDB room audit save failed:',
+      '[rooms/create] MongoDB room save failed:',
       persistErr instanceof Error ? persistErr.message : persistErr
     );
   }
@@ -73,6 +121,37 @@ async function handleCreateRoom(deps, req, res, next) {
     roomUrl: `${req.app.locals.env.CLIENT_URL}/room/${roomId}`,
     message: 'Share this link with your team to join the meeting',
   });
+}
+
+/**
+ * Restricts a student's track subscriptions to the admin (teacher) only.
+ * @param {{ restrictStudentToTeacherTracks: (roomId: string, studentIdentity: string) => Promise<{ success: true; restrictedTo?: string; note?: string }> }} deps
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {Promise<void>}
+ */
+async function handleRestrictStudent(deps, req, res, next) {
+  const { roomId } = req.params;
+  const { studentIdentity } = req.body || {};
+
+  if (!studentIdentity || typeof studentIdentity !== 'string' || studentIdentity.trim() === '') {
+    res.status(400).json({
+      error: 'studentIdentity is required',
+    });
+    return;
+  }
+
+  try {
+    const result = await deps.restrictStudentToTeacherTracks(roomId, studentIdentity.trim());
+    if (result.note) {
+      res.json({ success: true, note: result.note });
+      return;
+    }
+    res.json({ success: true, restrictedTo: result.restrictedTo ?? 'admin' });
+  } catch (_err) {
+    next(new AppError('Failed to restrict student permissions', 500));
+  }
 }
 
 /**
@@ -86,6 +165,11 @@ async function handleCreateRoom(deps, req, res, next) {
 async function handleListParticipants(deps, req, res, next) {
   try {
     const { roomId } = req.params;
+    try {
+      await deps.ensureRoomExists(roomId);
+    } catch (err) {
+      return res.json({ count: 0, participants: [] });
+    }
     const data = await deps.getCachedParticipants(roomId);
     res.json(data);
   } catch (e) {
@@ -257,7 +341,7 @@ async function handleDeleteRoom(deps, req, res, next) {
 
 /**
  * Creates the rooms router (create, list participants, delete).
- * @param {{ createRoom: (id: string) => Promise<unknown>; getCachedParticipants: (id: string) => Promise<{ count: number; participants: unknown[] }>; deleteRoom: (id: string) => Promise<void>; muteParticipant: (roomId: string, identity: string, muted: boolean) => Promise<void>; muteScreenShareTrack: (roomId: string, identity: string, muted: boolean) => Promise<void>; setScreenShare: (roomId: string, identity: string, allowed: boolean) => Promise<void>; removeParticipant: (roomId: string, identity: string) => Promise<void> }} deps
+ * @param {{ createRoom: (id: string) => Promise<unknown>; getCachedParticipants: (id: string) => Promise<{ count: number; participants: unknown[] }>; deleteRoom: (id: string) => Promise<void>; muteParticipant: (roomId: string, identity: string, muted: boolean) => Promise<void>; muteScreenShareTrack: (roomId: string, identity: string, muted: boolean) => Promise<void>; setScreenShare: (roomId: string, identity: string, allowed: boolean) => Promise<void>; removeParticipant: (roomId: string, identity: string) => Promise<void>; restrictStudentToTeacherTracks: (roomId: string, studentIdentity: string) => Promise<{ success: true; restrictedTo?: string; note?: string }> }} deps
  * @returns {import('express').Router}
  */
 function createRoomsRouter(deps) {
@@ -267,6 +351,11 @@ function createRoomsRouter(deps) {
     roomCreationLimiter,
     verifyAdmin,
     (req, res, next) => handleCreateRoom(deps, req, res, next)
+  );
+  router.post(
+    '/:roomId/restrict-student',
+    verifyAdmin,
+    (req, res, next) => handleRestrictStudent(deps, req, res, next)
   );
   router.post(
     '/:roomId/participants/:identity/mute',
@@ -296,6 +385,7 @@ function createRoomsRouter(deps) {
 module.exports = {
   createRoomsRouter,
   handleCreateRoom,
+  handleRestrictStudent,
   handleListParticipants,
   handleDeleteRoom,
   handleMuteParticipant,

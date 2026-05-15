@@ -1,4 +1,5 @@
 import axios, { type InternalAxiosRequestConfig } from "axios";
+import { assertValidRoomId, readAdminToken } from "@/lib/session";
 
 const baseURL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
@@ -18,7 +19,7 @@ api.interceptors.request.use((config) => {
   if (isPublicApiPath(config)) {
     return config;
   }
-  const token = typeof window !== "undefined" ? localStorage.getItem("adminToken") : null;
+  const token = readAdminToken();
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
@@ -81,6 +82,7 @@ export async function getParticipants(roomId: string): Promise<{
     hasActiveScreenShare: boolean;
   }[];
 }> {
+  assertValidRoomId(roomId);
   const { data } = await api.get(`/api/rooms/${encodeURIComponent(roomId)}/participants`);
   return data;
 }
@@ -90,6 +92,7 @@ export async function moderateParticipantMute(
   identity: string,
   muted: boolean
 ): Promise<{ success: true; muted: boolean }> {
+  assertValidRoomId(roomId);
   const { data } = await api.post(
     `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/mute`,
     { muted }
@@ -102,6 +105,7 @@ export async function moderateParticipantScreenShareMute(
   identity: string,
   muted: boolean
 ): Promise<{ success: true; muted: boolean }> {
+  assertValidRoomId(roomId);
   const { data } = await api.post(
     `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/screen-share/mute`,
     { muted }
@@ -114,6 +118,7 @@ export async function moderateParticipantScreenShare(
   identity: string,
   allowed: boolean
 ): Promise<{ success: true; allowed: boolean }> {
+  assertValidRoomId(roomId);
   const { data } = await api.post(
     `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}/screen-share`,
     { allowed }
@@ -125,6 +130,7 @@ export async function removeParticipantFromRoom(
   roomId: string,
   identity: string
 ): Promise<{ success: true }> {
+  assertValidRoomId(roomId);
   const { data } = await api.delete(
     `/api/rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(identity)}`
   );
@@ -132,6 +138,7 @@ export async function removeParticipantFromRoom(
 }
 
 export async function deleteRoom(roomId: string): Promise<{ success: true }> {
+  assertValidRoomId(roomId);
   const { data } = await api.delete(`/api/rooms/${encodeURIComponent(roomId)}`);
   return data;
 }
@@ -141,9 +148,10 @@ export async function getToken(
   participantName: string,
   isAdmin: boolean
 ): Promise<{ token: string; wsUrl: string }> {
+  assertValidRoomId(roomId);
   const headers: Record<string, string> = {};
   if (isAdmin) {
-    const t = typeof window !== "undefined" ? localStorage.getItem("adminToken") : null;
+    const t = readAdminToken();
     if (t) {
       headers.Authorization = `Bearer ${t}`;
     }

@@ -5,7 +5,7 @@ const AppError = require('../utils/AppError');
 
 /**
  * Issues a LiveKit access token after optional admin JWT verification and capacity checks.
- * @param {{ env: Record<string, string | number>; listParticipants: (roomId: string) => Promise<unknown[]>; buildJoinToken: (args: { roomId: string; isAdmin: boolean; participantName: string }) => Promise<string> }} deps
+ * @param {{ env: Record<string, string | number>; listParticipants: (roomId: string) => Promise<unknown[]>; buildJoinToken: (args: { roomId: string; isAdmin: boolean; participantName: string }) => Promise<string>; restrictStudentToTeacherTracks: (roomId: string, studentIdentity: string) => Promise<unknown> }} deps
  * @param {import('express').Request} req
  * @param {import('express').Response} res
  * @param {import('express').NextFunction} next
@@ -46,6 +46,12 @@ async function handleIssueToken(deps, req, res, next) {
       ? Promise.resolve().then(() => verifyAdminJwtFromHeader(authHeader, deps.env.JWT_SECRET))
       : Promise.resolve(null);
 
+    try {
+      await deps.ensureRoomExists(roomId);
+    } catch (err) {
+      return next(new AppError('Could not prepare room. Try again.', 503));
+    }
+
     const [, participants] = await Promise.all([adminPromise, deps.listParticipants(roomId)]);
 
     if (participants.length >= 30) {
@@ -58,16 +64,35 @@ async function handleIssueToken(deps, req, res, next) {
     // reject the connection at the SDK level.
     // No further action needed server-side.
 
+    const participantNameNormalized =
+      typeof participantName === 'string' ? participantName.trim() : '';
+
     const token = await deps.buildJoinToken({
       roomId,
       isAdmin: adminFlag,
-      participantName: typeof participantName === 'string' ? participantName : '',
+      participantName: participantNameNormalized,
     });
 
     res.json({
       token,
       wsUrl: deps.env.LIVEKIT_WS_URL,
     });
+
+    if (!adminFlag) {
+      setImmediate(() => {
+        void (async () => {
+          try {
+            await deps.restrictStudentToTeacherTracks(roomId, participantNameNormalized);
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[restrict-student] failed silently:',
+              e instanceof Error ? e.message : e
+            );
+          }
+        })();
+      });
+    }
   } catch (e) {
     const err = /** @type {Error & { statusCode?: number }} */ (e);
     if (typeof err.statusCode === 'number' && err.statusCode === 401) {
@@ -96,7 +121,7 @@ async function handleIssueToken(deps, req, res, next) {
 
 /**
  * Creates the token router for LiveKit access tokens.
- * @param {{ env: Record<string, string | number>; listParticipants: (roomId: string) => Promise<unknown[]>; buildJoinToken: (args: { roomId: string; isAdmin: boolean; participantName: string }) => Promise<string> }} deps
+ * @param {{ env: Record<string, string | number>; listParticipants: (roomId: string) => Promise<unknown[]>; buildJoinToken: (args: { roomId: string; isAdmin: boolean; participantName: string }) => Promise<string>; restrictStudentToTeacherTracks: (roomId: string, studentIdentity: string) => Promise<unknown> }} deps
  * @returns {import('express').Router}
  */
 function createTokenRouter(deps) {

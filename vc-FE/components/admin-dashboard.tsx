@@ -21,6 +21,10 @@ import {
   ScreenShareOff,
 } from "lucide-react";
 import { BrandIcon } from "./brand-icon";
+import { isValidRoomId, readAdminToken, readCachedRoomId } from "@/lib/session";
+
+const LS_PERMANENT_ROOM_ID = "techerudite_permanent_room_id";
+const LS_PERMANENT_ROOM_URL = "techerudite_permanent_room_url";
 
 export function AdminDashboard() {
   const { isAdmin, logout } = useAuth();
@@ -52,16 +56,31 @@ export function AdminDashboard() {
   }, [isAdmin, navigate]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localStorage.getItem("adminToken")) {
+    if (typeof window === "undefined" || !readAdminToken()) {
       return;
+    }
+    const cachedId = readCachedRoomId(LS_PERMANENT_ROOM_ID);
+    const cachedUrl = localStorage.getItem(LS_PERMANENT_ROOM_URL);
+    if (cachedId && cachedUrl && cachedUrl.startsWith("http")) {
+      setRoomId(cachedId);
+      setRoomUrl(cachedUrl);
     }
     let cancelled = false;
     (async () => {
       try {
         const data = await createRoom();
         if (cancelled) return;
-        setRoomId(data.roomId);
-        setRoomUrl(data.roomUrl);
+        const id = isValidRoomId(data.roomId) ? data.roomId : null;
+        const url =
+          typeof data.roomUrl === "string" && data.roomUrl.length > 0
+            ? data.roomUrl
+            : id
+              ? `${typeof window !== "undefined" ? window.location.origin : ""}/room/${id}`
+              : "";
+        setRoomId(id);
+        setRoomUrl(url);
+        if (id) localStorage.setItem(LS_PERMANENT_ROOM_ID, id);
+        if (url) localStorage.setItem(LS_PERMANENT_ROOM_URL, url);
         setCreateError("");
       } catch {
         if (!cancelled) {
@@ -77,15 +96,15 @@ export function AdminDashboard() {
   const pollParticipants = useCallback(async (id: string) => {
     try {
       const data = await getParticipants(id);
-      setParticipants(data.participants);
-      setParticipantCount(data.count);
+      setParticipants(Array.isArray(data.participants) ? data.participants : []);
+      setParticipantCount(typeof data.count === "number" ? data.count : 0);
     } catch {
       /* keep last known value */
     }
   }, []);
 
   useEffect(() => {
-    if (!roomId) return;
+    if (!isValidRoomId(roomId)) return;
     void pollParticipants(roomId);
     const id = window.setInterval(() => {
       void pollParticipants(roomId);
@@ -190,7 +209,7 @@ export function AdminDashboard() {
             <div className="flex gap-2">
               <input
                 type="text"
-                value={roomUrl}
+                value={roomUrl ?? ""}
                 readOnly
                 className="flex-1 px-4 py-3 bg-secondary border border-border rounded-lg text-foreground text-sm font-mono"
               />
@@ -217,7 +236,7 @@ export function AdminDashboard() {
 
           {/* Action Buttons */}
           <div className="flex flex-col sm:flex-row gap-3 mb-6">
-            <button
+            {/* <button
               type="button"
               onClick={handleShareWhatsApp}
               disabled={!roomUrl}
@@ -225,7 +244,7 @@ export function AdminDashboard() {
             >
               <MessageCircle className="w-5 h-5" />
               Share via WhatsApp
-            </button>
+            </button> */}
             <button
               type="button"
               onClick={handleStartMeeting}
@@ -274,13 +293,13 @@ export function AdminDashboard() {
             </div>
           )}
 
-          {participants.length === 0 ? (
+          {(participants ?? []).length === 0 ? (
             <p className="text-muted-foreground text-center py-8">
               No participants connected yet
             </p>
           ) : (
             <div className="space-y-3">
-              {participants.map((participant) => (
+              {(participants ?? []).map((participant) => (
                 <div
                   key={participant.identity}
                   className="flex flex-col gap-3 p-4 bg-secondary rounded-lg sm:flex-row sm:items-center sm:justify-between"

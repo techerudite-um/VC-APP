@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   LiveKitRoom,
@@ -8,10 +8,30 @@ import {
   useRoomContext,
   useParticipants,
   useLocalParticipant,
+  CarouselLayout,
+  Chat,
+  ConnectionStateToast,
+  FocusLayout,
+  FocusLayoutContainer,
+  LayoutContextProvider,
+  ParticipantTile,
+  RoomAudioRenderer,
+  useCreateLayoutContext,
+  usePinnedTracks,
+  useTracks,
 } from "@livekit/components-react";
-import { supportsScreenSharing } from "@livekit/components-core";
-import { Track } from "livekit-client";
-import { LiveMeetVideoConference } from "./livemeet-video-conference";
+import {
+  supportsScreenSharing,
+  isEqualTrackRef,
+  isTrackReference,
+  isWeb,
+  log,
+  type TrackReferenceOrPlaceholder,
+  type WidgetState,
+} from "@livekit/components-core";
+import { RoomEvent, Track } from "livekit-client";
+import * as React from "react";
+import { LiveMeetGridLayout } from "./livemeet-grid-layout";
 import { InRoomModerationPanel } from "./in-room-moderation-panel";
 import { BrandIcon } from "./brand-icon";
 import { useAuth } from "@/contexts/auth-context";
@@ -28,6 +48,129 @@ import {
   AlertTriangle,
   X,
 } from "lucide-react";
+
+/**
+ * Mirrors {@link LiveMeetVideoConference} layout; students only render gallery tiles for
+ * {@link visibleParticipants} (teacher `admin` only). Full-room audio is unchanged via {@link RoomAudioRenderer}.
+ */
+function TeacherStudentGalleryConference({
+  meetingIsAdmin,
+  className,
+}: {
+  meetingIsAdmin: boolean;
+  className?: string;
+}) {
+  const [widgetState, setWidgetState] = React.useState<WidgetState>({
+    showChat: false,
+    unreadMessages: 0,
+    showSettings: false,
+  });
+  const lastAutoFocusedScreenShareTrack = React.useRef<TrackReferenceOrPlaceholder | null>(null);
+
+  const participants = useParticipants();
+  const visibleParticipants = meetingIsAdmin
+    ? participants
+    : participants.filter((p) => p.identity === "admin");
+  const visibleIdentities = useMemo(
+    () => new Set(visibleParticipants.map((p) => p.identity)),
+    [visibleParticipants],
+  );
+
+  const tracks = useTracks(
+    [
+      { source: Track.Source.Camera, withPlaceholder: true },
+      { source: Track.Source.ScreenShare, withPlaceholder: false },
+    ],
+    { updateOnlyOn: [RoomEvent.ActiveSpeakersChanged], onlySubscribed: false },
+  );
+
+  const galleryTracks = useMemo(() => {
+    if (meetingIsAdmin) return tracks;
+    return tracks.filter((t) => visibleIdentities.has(t.participant.identity));
+  }, [meetingIsAdmin, tracks, visibleIdentities]);
+
+  const widgetUpdate = (state: WidgetState) => {
+    log.debug("updating widget state", state);
+    setWidgetState(state);
+  };
+
+  const layoutContext = useCreateLayoutContext();
+
+  const screenShareTracks = galleryTracks
+    .filter(isTrackReference)
+    .filter((track) => track.publication.source === Track.Source.ScreenShare);
+
+  const focusTrack = usePinnedTracks(layoutContext)?.[0];
+  const carouselTracks = galleryTracks.filter((track) => !isEqualTrackRef(track, focusTrack));
+
+  React.useEffect(() => {
+    if (
+      screenShareTracks.some((track) => track.publication.isSubscribed) &&
+      lastAutoFocusedScreenShareTrack.current === null
+    ) {
+      log.debug("Auto set screen share focus:", { newScreenShareTrack: screenShareTracks[0] });
+      layoutContext.pin.dispatch?.({ msg: "set_pin", trackReference: screenShareTracks[0] });
+      lastAutoFocusedScreenShareTrack.current = screenShareTracks[0];
+    } else if (
+      lastAutoFocusedScreenShareTrack.current &&
+      !screenShareTracks.some(
+        (track) =>
+          track.publication.trackSid ===
+          lastAutoFocusedScreenShareTrack.current?.publication?.trackSid,
+      )
+    ) {
+      log.debug("Auto clearing screen share focus.");
+      layoutContext.pin.dispatch?.({ msg: "clear_pin" });
+      lastAutoFocusedScreenShareTrack.current = null;
+    }
+    if (focusTrack && !isTrackReference(focusTrack)) {
+      const updatedFocusTrack = galleryTracks.find(
+        (tr) =>
+          tr.participant.identity === focusTrack.participant.identity &&
+          tr.source === focusTrack.source,
+      );
+      if (updatedFocusTrack !== focusTrack && isTrackReference(updatedFocusTrack)) {
+        layoutContext.pin.dispatch?.({ msg: "set_pin", trackReference: updatedFocusTrack });
+      }
+    }
+  }, [
+    screenShareTracks
+      .map((ref) => `${ref.publication.trackSid}_${ref.publication.isSubscribed}`)
+      .join(),
+    focusTrack?.publication?.trackSid,
+    galleryTracks,
+  ]);
+
+  return (
+    <div className={["lk-video-conference", className].filter(Boolean).join(" ")}>
+      {isWeb() && (
+        <LayoutContextProvider value={layoutContext} onWidgetChange={widgetUpdate}>
+          <div className="lk-video-conference-inner">
+            {!focusTrack ? (
+              <div className="lk-grid-layout-wrapper">
+                <LiveMeetGridLayout tracks={galleryTracks}>
+                  <ParticipantTile />
+                </LiveMeetGridLayout>
+              </div>
+            ) : (
+              <div className="lk-focus-layout-wrapper">
+                <FocusLayoutContainer>
+                  <CarouselLayout tracks={carouselTracks}>
+                    <ParticipantTile />
+                  </CarouselLayout>
+                  {focusTrack && <FocusLayout trackRef={focusTrack} />}
+                </FocusLayoutContainer>
+              </div>
+            )}
+          </div>
+          <Chat style={{ display: widgetState.showChat ? "grid" : "none" }} />
+        </LayoutContextProvider>
+      )}
+      <RoomAudioRenderer />
+      <ConnectionStateToast />
+    </div>
+  );
+}
 
 const MAX_PARTICIPANTS = 30;
 
@@ -94,6 +237,7 @@ export function VideoRoom() {
     >
       <VideoRoomChrome
         roomId={roomId}
+        meetingIsAdmin={meetingIsAdmin}
         connectMediaError={connectMediaError}
         onDismissConnectMediaError={() => setConnectMediaError("")}
       />
@@ -103,10 +247,12 @@ export function VideoRoom() {
 
 function VideoRoomChrome({
   roomId,
+  meetingIsAdmin,
   connectMediaError,
   onDismissConnectMediaError,
 }: {
   roomId: string;
+  meetingIsAdmin: boolean;
   connectMediaError: string;
   onDismissConnectMediaError: () => void;
 }) {
@@ -263,7 +409,7 @@ function VideoRoomChrome({
 
       <main className="flex min-h-0 flex-1 flex-col overflow-x-clip p-2 sm:p-4">
         <div className="flex min-h-0 flex-1 flex-col">
-          <LiveMeetVideoConference className="min-h-0 flex-1" />
+          <TeacherStudentGalleryConference meetingIsAdmin={meetingIsAdmin} className="min-h-0 flex-1" />
         </div>
       </main>
 

@@ -114,6 +114,37 @@ function createConferenceRoom(client, roomId) {
 }
 
 /**
+ * Ensures a LiveKit room exists.
+ * If the room was auto-deleted (emptyTimeout), this silently re-creates it with the same settings.
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @returns {Promise<void>}
+ */
+async function ensureRoomExists(client, roomId) {
+  try {
+    await client.listParticipants(roomId);
+  } catch (err) {
+    const isNotFound =
+      (err instanceof TwirpError && (err.status === 404 || err.code === 'not_found')) ||
+      String(err instanceof Error ? err.message : '').toLowerCase().includes('not found');
+
+    if (isNotFound) {
+      // eslint-disable-next-line no-console
+      console.log(`[ensureRoomExists] Room ${roomId} not found, re-creating...`);
+      await client.createRoom({
+        name: roomId,
+        maxParticipants: 30,
+        emptyTimeout: 300,
+      });
+      // eslint-disable-next-line no-console
+      console.log(`[ensureRoomExists] Room ${roomId} re-created successfully`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
  * Lists participants in a room.
  * @param {RoomServiceClient} client
  * @param {string} roomId
@@ -222,6 +253,56 @@ async function setParticipantScreenShareAllowed(client, roomId, identity, allowe
 async function removeRoomParticipant(client, roomId, identity) {
   await withLiveKitHandling(() => client.removeParticipant(roomId, identity));
   invalidateParticipantsCache(roomId);
+}
+
+/**
+ * Restricts a student participant's track subscriptions so they only subscribe to the admin's tracks.
+ * Unsubscribes from all other participants' published tracks (audio/video layout unchanged server-side).
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} studentIdentity
+ * @returns {Promise<{ success: true; restrictedTo?: string; note?: string }>}
+ */
+async function restrictStudentToTeacherTracks(client, roomId, studentIdentity) {
+  const participants = await withLiveKitHandling(() => client.listParticipants(roomId));
+  const adminParticipant = participants.find((p) => p.identity === 'admin');
+
+  if (!adminParticipant) {
+    await withLiveKitHandling(() =>
+      client.updateParticipant(roomId, studentIdentity, {
+        permission: {
+          canSubscribe: true,
+          canPublish: true,
+          canPublishData: true,
+          hidden: false,
+          recorder: false,
+        },
+      })
+    );
+    invalidateParticipantsCache(roomId);
+    return { success: true, note: 'Admin not yet in room, permissions set for when admin joins' };
+  }
+
+  const adminTrackSids = (adminParticipant.tracks ?? []).map((t) => t.sid).filter(Boolean);
+  if (adminTrackSids.length > 0) {
+    await withLiveKitHandling(() =>
+      client.updateSubscriptions(roomId, studentIdentity, adminTrackSids, true)
+    );
+  }
+
+  const otherParticipants = participants.filter(
+    (p) => p.identity !== 'admin' && p.identity !== studentIdentity
+  );
+  for (const other of otherParticipants) {
+    const otherTrackSids = (other.tracks ?? []).map((t) => t.sid).filter(Boolean);
+    if (otherTrackSids.length > 0) {
+      await withLiveKitHandling(() =>
+        client.updateSubscriptions(roomId, studentIdentity, otherTrackSids, false)
+      );
+    }
+  }
+  invalidateParticipantsCache(roomId);
+  return { success: true, restrictedTo: 'admin' };
 }
 
 /**
@@ -349,6 +430,7 @@ async function buildJoinToken(params) {
 module.exports = {
   getRoomServiceClient,
   createConferenceRoom,
+  ensureRoomExists,
   listRoomParticipants,
   deleteConferenceRoom,
   buildJoinToken,
@@ -358,5 +440,6 @@ module.exports = {
   muteParticipantScreenShareTracks,
   setParticipantScreenShareAllowed,
   removeRoomParticipant,
+  restrictStudentToTeacherTracks,
   invalidateParticipantsCache,
 };

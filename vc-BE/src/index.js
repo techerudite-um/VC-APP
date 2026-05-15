@@ -9,6 +9,7 @@ const { connectDB } = require('./services/mongoService');
 const {
   getRoomServiceClient,
   createConferenceRoom,
+  ensureRoomExists,
   listRoomParticipants,
   deleteConferenceRoom,
   buildJoinToken,
@@ -17,6 +18,7 @@ const {
   muteParticipantScreenShareTracks,
   setParticipantScreenShareAllowed,
   removeRoomParticipant,
+  restrictStudentToTeacherTracks,
   getCachedParticipants,
 } = require('./services/livekitService');
 const { createApiRateLimiter } = require('./middleware/rateLimiter');
@@ -80,11 +82,21 @@ async function main() {
   const app = express();
   app.locals.env = env;
 
-  app.use(helmet());
-  app.use(compression());
+  // app.use(helmet());
+  // app.use(compression());
+  // CORS is required for the browser-based frontend to call this API.
+  // We restrict to the configured frontend origin to avoid being overly permissive.
   app.use(
     cors({
-      origin: "*"
+      origin: (origin, callback) => {
+        // Allow non-browser requests (e.g., curl) that don't send an Origin header.
+        if (!origin) return callback(null, true);
+        if (origin === env.CLIENT_URL) return callback(null, true);
+        return callback(new Error(`Not allowed by CORS: ${origin}`));
+      },
+      credentials: false,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
     })
   );
   app.use(express.json());
@@ -100,6 +112,7 @@ async function main() {
     '/rooms',
     createRoomsRouter({
       createRoom: (roomId) => createConferenceRoom(roomClient, roomId),
+      ensureRoomExists: (roomId) => ensureRoomExists(roomClient, roomId),
       getCachedParticipants: (roomId) => getCachedParticipants(roomId),
       deleteRoom: (roomId) => deleteConferenceRoom(roomClient, roomId),
       muteParticipant: (roomId, identity, muted) =>
@@ -109,6 +122,8 @@ async function main() {
       setScreenShare: (roomId, identity, allowed) =>
         setParticipantScreenShareAllowed(roomClient, roomId, identity, allowed),
       removeParticipant: (roomId, identity) => removeRoomParticipant(roomClient, roomId, identity),
+      restrictStudentToTeacherTracks: (roomId, studentIdentity) =>
+        restrictStudentToTeacherTracks(roomClient, roomId, studentIdentity),
     })
   );
 
@@ -116,6 +131,7 @@ async function main() {
     '/token',
     createTokenRouter({
       env,
+      ensureRoomExists: (roomId) => ensureRoomExists(roomClient, roomId),
       listParticipants: (roomId) => listRoomParticipants(roomClient, roomId),
       buildJoinToken: ({ roomId, isAdmin, participantName }) =>
         buildJoinToken({
@@ -125,6 +141,8 @@ async function main() {
           isAdmin,
           participantName,
         }),
+      restrictStudentToTeacherTracks: (roomId, studentIdentity) =>
+        restrictStudentToTeacherTracks(roomClient, roomId, studentIdentity),
     })
   );
 
