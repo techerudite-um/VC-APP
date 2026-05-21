@@ -182,9 +182,17 @@ async function muteParticipantMicrophone(client, roomId, identity, muted) {
   const info = await withLiveKitHandling(() => client.getParticipant(roomId, identity));
   const mic = info.tracks?.find((t) => t.source === TrackSource.MICROPHONE);
   if (!mic?.sid) {
+    if (muted) {
+      invalidateParticipantsCache(roomId);
+      return;
+    }
     const e = new Error('Participant has no microphone track');
     e.statusCode = 404;
     throw e;
+  }
+  if (Boolean(mic.muted) === Boolean(muted)) {
+    invalidateParticipantsCache(roomId);
+    return;
   }
   await withLiveKitHandling(() => client.mutePublishedTrack(roomId, identity, mic.sid, muted));
   invalidateParticipantsCache(roomId);
@@ -246,6 +254,46 @@ async function setParticipantScreenShareAllowed(client, roomId, identity, allowe
 }
 
 /**
+ * Default student publish: camera + microphone only (no screen share).
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} identity
+ */
+async function setStudentDefaultPublishPermissions(client, roomId, identity) {
+  await setParticipantScreenShareAllowed(client, roomId, identity, false);
+}
+
+/**
+ * Enable screen share for one student; disable for all other non-admin participants.
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ * @param {string} studentIdentity
+ * @param {boolean} enable
+ */
+async function toggleStudentScreenSharePermission(client, roomId, studentIdentity, enable) {
+  if (enable) {
+    const participants = await withLiveKitHandling(() => client.listParticipants(roomId));
+    const otherStudents = participants.filter(
+      (p) => p.identity !== 'admin' && p.identity !== studentIdentity
+    );
+    for (const student of otherStudents) {
+      try {
+        await setStudentDefaultPublishPermissions(client, roomId, student.identity);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[screen-share] disable failed for ${student.identity}:`,
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+    await setParticipantScreenShareAllowed(client, roomId, studentIdentity, true);
+  } else {
+    await setParticipantScreenShareAllowed(client, roomId, studentIdentity, false);
+  }
+}
+
+/**
  * @param {RoomServiceClient} client
  * @param {string} roomId
  * @param {string} identity
@@ -303,6 +351,96 @@ async function restrictStudentToTeacherTracks(client, roomId, studentIdentity) {
   }
   invalidateParticipantsCache(roomId);
   return { success: true, restrictedTo: 'admin' };
+}
+
+/**
+ * Re-subscribe all students to every track the admin is currently publishing
+ * (camera, screen share, screen audio). Call when admin starts screen sharing.
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ */
+async function syncStudentsToAdminTracks(client, roomId) {
+  const participants = await withLiveKitHandling(() => client.listParticipants(roomId));
+  const adminParticipant = participants.find((p) => p.identity === 'admin');
+
+  if (!adminParticipant) {
+    return { success: true, note: 'No admin in room' };
+  }
+
+  const adminTrackSids = (adminParticipant.tracks ?? []).map((t) => t.sid).filter(Boolean);
+  const students = participants.filter((p) => p.identity !== 'admin');
+
+  for (const student of students) {
+    if (adminTrackSids.length > 0) {
+      await withLiveKitHandling(() =>
+        client.updateSubscriptions(roomId, student.identity, adminTrackSids, true)
+      );
+    }
+
+    for (const other of participants) {
+      if (other.identity === 'admin' || other.identity === student.identity) continue;
+      const otherTrackSids = (other.tracks ?? []).map((t) => t.sid).filter(Boolean);
+      if (otherTrackSids.length > 0) {
+        await withLiveKitHandling(() =>
+          client.updateSubscriptions(roomId, student.identity, otherTrackSids, false)
+        );
+      }
+    }
+  }
+
+  invalidateParticipantsCache(roomId);
+  return { success: true };
+}
+
+/**
+ * Subscribe the host (admin) to every track students are publishing (camera, screen share, etc.).
+ * Required when students use selective subscription or after new tracks are published.
+ * @param {RoomServiceClient} client
+ * @param {string} roomId
+ */
+async function syncAdminToStudentTracks(client, roomId) {
+  const delays = [0, 400, 1000];
+  let lastCount = 0;
+
+  for (const delayMs of delays) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+
+    const participants = await withLiveKitHandling(() => client.listParticipants(roomId));
+    const adminParticipant = participants.find((p) => p.identity === 'admin');
+
+    if (!adminParticipant) {
+      return { success: true, note: 'No admin in room' };
+    }
+
+    const students = participants.filter((p) => p.identity !== 'admin');
+    const studentTrackSids = [];
+
+    for (const student of students) {
+      let info = student;
+      try {
+        info = await withLiveKitHandling(() => client.getParticipant(roomId, student.identity));
+      } catch {
+        /* use list snapshot */
+      }
+      for (const track of info.tracks ?? []) {
+        if (track.sid) studentTrackSids.push(track.sid);
+      }
+    }
+
+    const uniqueSids = [...new Set(studentTrackSids)];
+    lastCount = uniqueSids.length;
+
+    if (uniqueSids.length > 0) {
+      await withLiveKitHandling(() =>
+        client.updateSubscriptions(roomId, 'admin', uniqueSids, true)
+      );
+    }
+  }
+
+  invalidateParticipantsCache(roomId);
+  return { success: true, trackCount: lastCount };
 }
 
 /**
@@ -439,7 +577,11 @@ module.exports = {
   muteParticipantMicrophone,
   muteParticipantScreenShareTracks,
   setParticipantScreenShareAllowed,
+  setStudentDefaultPublishPermissions,
+  toggleStudentScreenSharePermission,
   removeRoomParticipant,
   restrictStudentToTeacherTracks,
+  syncStudentsToAdminTracks,
+  syncAdminToStudentTracks,
   invalidateParticipantsCache,
 };
